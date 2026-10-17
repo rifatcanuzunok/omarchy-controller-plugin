@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "rifatcanuzunok.controller",
+  "name": "Xbox Controller",
+  "version": "1.0.0",
+  "author": "Rıfatcan Uzunok",
+  "license": "MIT",
+  "description": "Xbox and Gamepad status popup bar widget with battery monitor and Bluetooth connection controls for Omarchy.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Controller.qml"
+  },
+  "barWidget": {
+    "displayName": "Xbox Controller",
+    "description": "Xbox and Gamepad battery monitor and connection manager popup",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
