@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+import sys
+import os
+import glob
+import re
+import json
+import subprocess
+
+def get_system_lang():
+    lang = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "en").lower()
+    return "tr" if lang.startswith("tr") else "en"
+
+def get_paired_bluetooth_gamepads():
+    """Finds all paired gamepads from bluetoothctl devices."""
+    gamepads = []
+    try:
+        res = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True, timeout=1.5)
+        for line in res.stdout.splitlines():
+            m = re.match(r"^Device\s+(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})\s+(.+)", line.strip())
+            if m:
+                mac, name = m.group(1), m.group(3)
+                lower_name = name.lower()
+                if any(k in lower_name for k in ["xbox", "controller", "gamepad", "wireless controller", "dualshock", "dualsense", "switch"]):
+                    gamepads.append((mac, name))
+    except Exception:
+        pass
+    return gamepads
+
+def get_status():
+    lang = get_system_lang()
+    default_name = "Xbox Kontrolcüsü" if lang == "tr" else "Xbox Controller"
+    wired_battery_text = "Kablolu (Güç bağlı)" if lang == "tr" else "Wired (Powered)"
+
+    status = {
+        "connected": False,
+        "name": default_name,
+        "type": "none",
+        "battery": -1,
+        "battery_text": "—",
+        "address": ""
+    }
+
+    paired_gamepads = get_paired_bluetooth_gamepads()
+
+    # 1. Check Bluetooth gamepads
+    for mac, fallback_name in paired_gamepads:
+        try:
+            res = subprocess.run(["bluetoothctl", "info", mac], capture_output=True, text=True, timeout=1.5)
+            if "Connected: yes" in res.stdout:
+                status["connected"] = True
+                status["type"] = "bluetooth"
+                status["address"] = mac
+                name_m = re.search(r"Name:\s*(.+)", res.stdout)
+                status["name"] = name_m.group(1).strip() if name_m else fallback_name
+                
+                # Check battery in bluetoothctl
+                bat_m = re.search(r"Battery Percentage: [^\(]+\((\d+)\)", res.stdout)
+                if bat_m:
+                    status["battery"] = int(bat_m.group(1))
+                    status["battery_text"] = f"%{status['battery']}"
+                else:
+                    # Fallback to upower
+                    try:
+                        up_devs = subprocess.check_output(["upower", "-e"], text=True, stderr=subprocess.DEVNULL, timeout=1).splitlines()
+                        for dev in up_devs:
+                            if "gaming_input" in dev or mac.replace(":", "_") in dev:
+                                info = subprocess.check_output(["upower", "-i", dev], text=True, stderr=subprocess.DEVNULL, timeout=1)
+                                m = re.search(r"percentage:\s+(\d+)%", info)
+                                if m:
+                                    status["battery"] = int(m.group(1))
+                                    status["battery_text"] = f"%{status['battery']}"
+                                    break
+                    except Exception:
+                        pass
+                return status
+        except Exception:
+            continue
+
+    # Remember the primary paired gamepad MAC for connect action even if disconnected
+    if paired_gamepads:
+        status["address"] = paired_gamepads[0][0]
+        status["name"] = paired_gamepads[0][1]
+
+    # 2. Check /sys/class/input/js* for wired connections
+    for js in sorted(glob.glob("/sys/class/input/js*")):
+        try:
+            name_file = os.path.join(js, "device", "name")
+            if os.path.exists(name_file):
+                with open(name_file) as f:
+                    dev_name = f.read().strip()
+                if any(x in dev_name.lower() for x in ["xbox", "gamepad", "controller", "joystick"]):
+                    status["connected"] = True
+                    status["name"] = dev_name
+                    status["type"] = "wired"
+                    status["battery"] = 100
+                    status["battery_text"] = wired_battery_text
+                    return status
+        except Exception:
+            pass
+
+    return status
+
+def connect_device(mac=None):
+    if not mac:
+        gamepads = get_paired_bluetooth_gamepads()
+        if gamepads:
+            mac = gamepads[0][0]
+    if mac:
+        subprocess.run(["bluetoothctl", "connect", mac], check=False)
+
+def disconnect_device(mac=None):
+    if not mac:
+        gamepads = get_paired_bluetooth_gamepads()
+        if gamepads:
+            mac = gamepads[0][0]
+    if mac:
+        subprocess.run(["bluetoothctl", "disconnect", mac], check=False)
+
+def toggle_connection():
+    st = get_status()
+    if st["connected"] and st["type"] == "bluetooth":
+        disconnect_device(st.get("address"))
+    else:
+        connect_device(st.get("address"))
+
+def send_notification(status):
+    lang = get_system_lang()
+    if status["connected"]:
+        conn_str = ("Bluetooth" if status["type"] == "bluetooth" else ("USB Kablo" if lang == "tr" else "USB Cable"))
+        if lang == "tr":
+            title = f"Xbox Kontrolcüsü: Bağlı ({status['battery_text']})"
+            body = f"<b>Durum:</b> Bağlı ({conn_str})\n<b>Pil Seviyesi:</b> {status['battery_text']}\n<b>Cihaz:</b> {status['name']}"
+        else:
+            title = f"Xbox Controller: Connected ({status['battery_text']})"
+            body = f"<b>Status:</b> Connected ({conn_str})\n<b>Battery:</b> {status['battery_text']}\n<b>Device:</b> {status['name']}"
+    else:
+        if lang == "tr":
+            title = "Xbox Kontrolcüsü: Bağlı Değil"
+            body = "Herhangi bir kontrolcü algılanmadı.\nBağlanmak için kolu açın."
+        else:
+            title = "Xbox Controller: Disconnected"
+            body = "No game controller detected.\nTurn on the controller to connect."
+
+    subprocess.run([
+        "notify-send",
+        "-a", "Xbox Controller",
+        "-i", "input-gaming",
+        "-h", "string:x-canonical-private-synchronous:controller_status",
+        title,
+        body
+    ], check=False)
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "--json"
+    status = get_status()
+
+    if arg == "--notify":
+        send_notification(status)
+    elif arg == "--connect":
+        connect_device(status.get("address"))
+    elif arg == "--disconnect":
+        disconnect_device(status.get("address"))
+    elif arg == "--toggle":
+        toggle_connection()
+    else:
+        print(json.dumps(status, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
